@@ -1085,7 +1085,6 @@ UPPER:                               'UPPER';
 UUID:                                'UUID';
 UUID_SHORT:                          'UUID_SHORT';
 VALIDATE_PASSWORD_STRENGTH:          'VALIDATE_PASSWORD_STRENGTH';
-VIA:                                 'VIA'; // MariaDB
 VERSION:                             'VERSION';
 WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS:   'WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS';
 WEEKDAY:                             'WEEKDAY';
@@ -1097,6 +1096,12 @@ Y_FUNCTION:                          'Y';
 X_FUNCTION:                          'X';
 
 
+// MariaDB tokens
+VIA:                                 'VIA';
+LASTVAL:                             'LASTVAL';
+NEXTVAL:                             'NEXTVAL';
+SETVAL:                              'SETVAL';
+PREVIOUS:                            'PREVIOUS';
 
 // Operators
 // Operators. Assigns
@@ -1243,7 +1248,7 @@ fragment CHARSET_NAME:               ARMSCII8 | ASCII | BIG5 | BINARY | CP1250
                                      | UTF8 | UTF8MB3 | UTF8MB4;
 
 fragment EXPONENT_NUM_PART:          'E' [-+]? DEC_DIGIT+;
-fragment ID_LITERAL:                 [A-Z_$0-9]*?[A-Z_$]+?[A-Z_$0-9]*;
+fragment ID_LITERAL:                 [A-Z_$0-9\u0080-\uFFFF]*?[A-Z_$\u0080-\uFFFF]+?[A-Z_$0-9\u0080-\uFFFF]*;
 fragment DQUOTA_STRING:              '"' ( '\\'. | '""' | ~('"'| '\\') )* '"';
 fragment SQUOTA_STRING:              '\'' ('\\'. | '\'\'' | ~('\'' | '\\'))* '\'';
 fragment BQUOTA_STRING:              '`' ( '\\'. | '``' | ~('`'|'\\'))* '`';

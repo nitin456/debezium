@@ -31,6 +31,11 @@ create table table_with_index (id int, data varchar(50), UNIQUE INDEX `data_UNIQ
 create table transactional_table(name varchar(255), class_id int, id int) transactional=1;
 create table transactional(name varchar(255), class_id int, id int);
 create table add_test(col1 varchar(255), col2 int, col3 int);
+create table blob_test(id int, col1 blob(45));
+CREATE TABLE `user_account` ( `id1` bigint(20) unsigned NOT NULL DEFAULT nextval(`useraccount`.`user_account_id_seq`));
+create table žluťoučký (kůň int);
+CREATE TABLE staff (PRIMARY KEY (staff_num), staff_num INT(5) NOT NULL, first_name VARCHAR(100) NOT NULL, pens_in_drawer INT(2) NOT NULL, CONSTRAINT pens_in_drawer_range CHECK(pens_in_drawer BETWEEN 1 AND 99));
+create table column_names_as_aggr_funcs(min varchar(100), max varchar(100), sum varchar(100), count varchar(100));
 #end
 #begin
 -- Rename table
