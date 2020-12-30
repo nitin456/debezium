@@ -5,16 +5,6 @@
  */
 package io.debezium.connector.mysql;
 
-import io.debezium.annotation.NotThreadSafe;
-import io.debezium.config.Configuration;
-import io.debezium.connector.AbstractSourceInfo;
-import io.debezium.connector.SnapshotRecord;
-import io.debezium.data.Envelope;
-import io.debezium.document.Document;
-import io.debezium.relational.TableId;
-import io.debezium.util.Collect;
-import org.apache.kafka.connect.errors.ConnectException;
-
 import java.time.Instant;
 import java.util.Collections;
 import java.util.HashMap;
@@ -23,6 +13,17 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+
+import org.apache.kafka.connect.errors.ConnectException;
+
+import io.debezium.annotation.NotThreadSafe;
+import io.debezium.config.Configuration;
+import io.debezium.connector.AbstractSourceInfo;
+import io.debezium.connector.SnapshotRecord;
+import io.debezium.data.Envelope;
+import io.debezium.document.Document;
+import io.debezium.relational.TableId;
+import io.debezium.util.Collect;
 
 /**
  * Information about the source of information, which includes the position in the source binary log we have previously processed.
@@ -146,7 +147,7 @@ final class SourceInfo extends AbstractSourceInfo {
     private String tableExcludeList;
     private Set<TableId> tableIds;
     private String databaseName;
-    private long modifiedCommitTime = 0;
+    private long modifiedCommitTime = -1;
 
     public SourceInfo(MySqlConnectorConfig connectorConfig) {
         super(connectorConfig);
@@ -267,6 +268,7 @@ final class SourceInfo extends AbstractSourceInfo {
         }
         map.put(BINLOG_FILENAME_OFFSET_KEY, restartBinlogFilename);
         map.put(BINLOG_POSITION_OFFSET_KEY, restartBinlogPosition);
+        map.put(MODIFIED_COMMIT_TIME, modifiedCommitTime);
         if (restartEventsToSkip != 0) {
             map.put(EVENTS_TO_SKIP_OFFSET_KEY, restartEventsToSkip);
         }
@@ -402,7 +404,10 @@ final class SourceInfo extends AbstractSourceInfo {
 
     // TODO: add comment
     public void setModifiedCommitTime(long modifiedCommitTime) {
-        this.modifiedCommitTime = modifiedCommitTime;
+        if (this.modifiedCommitTime < 0) {
+            this.modifiedCommitTime = modifiedCommitTime;
+        }
+        this.modifiedCommitTime = Math.max(modifiedCommitTime, this.modifiedCommitTime);
     }
 
     /**
@@ -531,6 +536,9 @@ final class SourceInfo extends AbstractSourceInfo {
             }
             if (sourceOffset.containsKey(TABLE_EXCLUDE_LIST_KEY)) {
                 this.tableExcludeList = (String) sourceOffset.get(TABLE_EXCLUDE_LIST_KEY);
+            }
+            if (sourceOffset.containsKey(MODIFIED_COMMIT_TIME)) {
+                this.modifiedCommitTime = (Long) sourceOffset.get(MODIFIED_COMMIT_TIME);
             }
             else {
                 this.tableExcludeList = (String) sourceOffset.get(TABLE_BLACKLIST_KEY);

@@ -722,6 +722,7 @@ public class BinlogReader extends AbstractReader {
         GtidEventData gtidEvent = unwrapData(event);
         String gtid = gtidEvent.getGtid();
         gtidSet.add(gtid);
+        source.setModifiedCommitTime(event.getHeader().getTimestamp());
         source.startGtid(gtid, gtidSet.toString()); // rather than use the client's GTID set
         ignoreDmlEventByGtidSource = false;
         if (gtidDmlSourceFilter != null && gtid != null) {
@@ -761,6 +762,7 @@ public class BinlogReader extends AbstractReader {
         if (sql.equalsIgnoreCase("BEGIN")) {
             // We are starting a new transaction ...
             source.startNextTransaction();
+            source.setModifiedCommitTime(event.getHeader().getTimestamp());
             source.setBinlogThread(command.getThreadId());
             if (initialEventsToSkip != 0) {
                 logger.debug("Restarting partially-processed transaction; change events will not be created for the first {} events plus {} more rows in the next event",
