@@ -813,6 +813,7 @@ public class BinlogReader extends AbstractReader {
 
     private void handleTransactionCompletion(Event event) {
         // We are completing the transaction ...
+        logger.info("handleTransactionCompletion event: {}", event);
         source.commitTransaction();
         source.setBinlogThread(-1L);
         skipEvent = false;

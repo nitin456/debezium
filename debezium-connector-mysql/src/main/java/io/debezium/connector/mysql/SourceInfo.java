@@ -5,17 +5,6 @@
  */
 package io.debezium.connector.mysql;
 
-import java.time.Instant;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-import java.util.function.Predicate;
-import java.util.stream.Collectors;
-
-import org.apache.kafka.connect.errors.ConnectException;
-
 import io.debezium.annotation.NotThreadSafe;
 import io.debezium.config.Configuration;
 import io.debezium.connector.AbstractSourceInfo;
@@ -24,6 +13,16 @@ import io.debezium.data.Envelope;
 import io.debezium.document.Document;
 import io.debezium.relational.TableId;
 import io.debezium.util.Collect;
+import org.apache.kafka.connect.errors.ConnectException;
+
+import java.time.Instant;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 /**
  * Information about the source of information, which includes the position in the source binary log we have previously processed.
@@ -111,6 +110,7 @@ final class SourceInfo extends AbstractSourceInfo {
     public static final String TIMESTAMP_KEY = "ts_sec";
     public static final String THREAD_KEY = "thread";
     public static final String QUERY_KEY = "query";
+    public static final String MODIFIED_COMMIT_TIME = "modified_commit_ts";
     public static final String DATABASE_WHITELIST_KEY = "database_whitelist";
     public static final String DATABASE_INCLUDE_LIST_KEY = "database_include_list";
     public static final String DATABASE_BLACKLIST_KEY = "database_blacklist";
@@ -146,6 +146,7 @@ final class SourceInfo extends AbstractSourceInfo {
     private String tableExcludeList;
     private Set<TableId> tableIds;
     private String databaseName;
+    private long modifiedCommitTime = 0;
 
     public SourceInfo(MySqlConnectorConfig connectorConfig) {
         super(connectorConfig);
@@ -397,6 +398,11 @@ final class SourceInfo extends AbstractSourceInfo {
      */
     public void setBinlogTimestampSeconds(long timestampInSeconds) {
         this.binlogTimestampSeconds = timestampInSeconds;
+    }
+
+    // TODO: add comment
+    public void setModifiedCommitTime(long modifiedCommitTime) {
+        this.modifiedCommitTime = modifiedCommitTime;
     }
 
     /**
@@ -659,6 +665,10 @@ final class SourceInfo extends AbstractSourceInfo {
 
     int getCurrentRowNumber() {
         return currentRowNumber;
+    }
+
+    long getModifiedCommitTime() {
+        return modifiedCommitTime;
     }
 
     @Override
