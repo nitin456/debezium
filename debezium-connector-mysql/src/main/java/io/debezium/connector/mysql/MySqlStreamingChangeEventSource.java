@@ -9,7 +9,6 @@ import static io.debezium.util.Strings.isNullOrEmpty;
 
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.io.Serializable;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
@@ -20,17 +19,16 @@ import java.security.cert.X509Certificate;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.BitSet;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import java.util.function.Predicate;
 
 import javax.net.ssl.KeyManager;
@@ -73,7 +71,6 @@ import io.debezium.config.CommonConnectorConfig.EventProcessingFailureHandlingMo
 import io.debezium.config.Configuration;
 import io.debezium.connector.mysql.MySqlConnectorConfig.GtidNewChannelPosition;
 import io.debezium.connector.mysql.MySqlConnectorConfig.SecureConnectionMode;
-import io.debezium.connector.mysql.RecordMakers.RecordsForTable;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.function.BlockingConsumer;
 import io.debezium.pipeline.ErrorHandler;
@@ -100,8 +97,6 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
     private static final String KEEPALIVE_THREAD_NAME = "blc-keepalive";
 
     private final boolean recordSchemaChangesInSourceRecords;
-    private final RecordMakers recordMakers;
-    private final SourceInfo source;
     private final EnumMap<EventType, BlockingConsumer<Event>> eventHandlers = new EnumMap<>(EventType.class);
     private final BinaryLogClient client;
     private final MySqlStreamingChangeEventSourceMetrics metrics;
@@ -128,6 +123,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
     private final EventDispatcher<TableId> eventDispatcher;
     private final MySqlOffsetContext offsetContext;
     private final ErrorHandler errorHandler;
+    private Instant eventTimestamp;
 
     public static class BinlogPosition {
         final String filename;
@@ -184,6 +180,11 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         }
     }
 
+    @FunctionalInterface
+    private static interface BinlogChangeEmitter<T> {
+        void emit(TableId tableId, T data) throws InterruptedException;
+    }
+
     public MySqlStreamingChangeEventSource(MySqlConnectorConfig connectorConfig, MySqlOffsetContext offsetContext, MySqlConnection connection,
                                            EventDispatcher<TableId> dispatcher, ErrorHandler errorHandler, Clock clock,
                                            MySqlTaskContext taskContext, MySqlStreamingChangeEventSourceMetrics metrics) {
@@ -198,8 +199,6 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         this.offsetContext = (offsetContext == null) ? MySqlOffsetContext.initial(connectorConfig) : offsetContext;
         this.metrics = metrics;
 
-        source = this.offsetContext.getSource();
-        recordMakers = new RecordMakers(taskContext.getSchema(), source, taskContext.getTopicSelector(), connectorConfig.isEmitTombstoneOnDelete(), null);
         recordSchemaChangesInSourceRecords = connectorConfig.includeSchemaChangeRecords();
         eventDeserializationFailureHandlingMode = connectorConfig.getEventProcessingFailureHandlingMode();
         inconsistentSchemaHandlingMode = connectorConfig.inconsistentSchemaFailureHandlingMode();
@@ -323,17 +322,14 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
             return;
         }
 
+        final EventHeader eventHeader = event.getHeader();
         // Update the source offset info. Note that the client returns the value in *milliseconds*, even though the binlog
         // contains only *seconds* precision ...
-        EventHeader eventHeader = event.getHeader();
-        if (!eventHeader.getEventType().equals(EventType.HEARTBEAT)) {
-            // HEARTBEAT events have no timestamp; only set the timestamp if the event is not a HEARTBEAT
-            source.setBinlogTimestampSeconds(eventHeader.getTimestamp() / 1000L); // client returns milliseconds,
-                                                                                  // but only second precision
-        }
+        // HEARTBEAT events have no timestamp; only set the timestamp if the event is not a HEARTBEAT
+        eventTimestamp = !eventHeader.getEventType().equals(EventType.HEARTBEAT) ? Instant.ofEpochMilli(eventHeader.getTimestamp()) : null;
+        offsetContext.setBinlogThread(eventHeader.getServerId());
 
-        source.setBinlogServerId(eventHeader.getServerId());
-        EventType eventType = eventHeader.getEventType();
+        final EventType eventType = eventHeader.getEventType();
         if (eventType == EventType.ROTATE) {
             EventData eventData = event.getData();
             RotateEventData rotateEventData;
@@ -343,11 +339,11 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
             else {
                 rotateEventData = (RotateEventData) eventData;
             }
-            source.setBinlogStartPoint(rotateEventData.getBinlogFilename(), rotateEventData.getBinlogPosition());
+            offsetContext.setBinlogStartPoint(rotateEventData.getBinlogFilename(), rotateEventData.getBinlogPosition());
         }
         else if (eventHeader instanceof EventHeaderV4) {
             EventHeaderV4 trackableEventHeader = (EventHeaderV4) eventHeader;
-            source.setEventPosition(trackableEventHeader.getPosition(), trackableEventHeader.getEventLength());
+            offsetContext.setEventPosition(trackableEventHeader.getPosition(), trackableEventHeader.getEventLength());
         }
 
         // If there is a handler for this event, forward the event to it ...
@@ -359,7 +355,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
             eventDispatcher.dispatchHeartbeatEvent(offsetContext);
 
             // Capture that we've completed another event ...
-            source.completeEvent();
+            offsetContext.completeEvent();
 
             if (skipEvent) {
                 // We're in the mode of skipping events and we just skipped this one, so decrement our skip count ...
@@ -432,11 +428,11 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
                 LOGGER.error(
                         "Error while deserializing binlog event at offset {}.{}" +
                                 "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
-                        source.offset(),
+                        offsetContext.getOffset(),
                         System.lineSeparator(),
                         eventHeader.getPosition(),
                         eventHeader.getNextPosition(),
-                        source.binlogFilename());
+                        offsetContext.getSource().binlogFilename());
 
                 throw new RuntimeException(data.getCause());
             }
@@ -445,12 +441,12 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
                         "Error while deserializing binlog event at offset {}.{}" +
                                 "This exception will be ignored and the event be skipped.{}" +
                                 "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
-                        source.offset(),
+                        offsetContext.getOffset(),
                         System.lineSeparator(),
                         System.lineSeparator(),
                         eventHeader.getPosition(),
                         eventHeader.getNextPosition(),
-                        source.binlogFilename(),
+                        offsetContext.getSource().binlogFilename(),
                         data.getCause());
             }
         }
@@ -462,7 +458,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
     /**
      * Handle the supplied event with a {@link RotateEventData} that signals the logs are being rotated. This means that either
      * the server was restarted, or the binlog has transitioned to a new file. In either case, subsequent table numbers will be
-     * different than those seen to this point, so we need to {@link RecordMakers#clear() discard the cache of record makers}.
+     * different than those seen to this point.
      *
      * @param event the database change data event to be processed; may not be null
      */
@@ -470,7 +466,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         LOGGER.debug("Rotating logs: {}", event);
         RotateEventData command = unwrapData(event);
         assert command != null;
-        recordMakers.clear();
+        taskContext.getSchema().clearTableMappings();
     }
 
     /**
@@ -491,7 +487,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         GtidEventData gtidEvent = unwrapData(event);
         String gtid = gtidEvent.getGtid();
         gtidSet.add(gtid);
-        source.startGtid(gtid, gtidSet.toString()); // rather than use the client's GTID set
+        offsetContext.startGtid(gtid, gtidSet.toString()); // rather than use the client's GTID set
         ignoreDmlEventByGtidSource = false;
         if (gtidDmlSourceFilter != null && gtid != null) {
             String uuid = gtid.trim().substring(0, gtid.indexOf(":"));
@@ -513,7 +509,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         final RowsQueryEventData lastRowsQueryEventData = unwrapData(event);
 
         // Set the query on the source
-        source.setQuery(lastRowsQueryEventData.getQuery());
+        offsetContext.setQuery(lastRowsQueryEventData.getQuery());
     }
 
     /**
@@ -529,8 +525,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         String sql = command.getSql().trim();
         if (sql.equalsIgnoreCase("BEGIN")) {
             // We are starting a new transaction ...
-            source.startNextTransaction();
-            source.setBinlogThread(command.getThreadId());
+            offsetContext.startNextTransaction();
+            offsetContext.setBinlogThread(command.getThreadId());
             if (initialEventsToSkip != 0) {
                 LOGGER.debug("Restarting partially-processed transaction; change events will not be created for the first {} events plus {} more rows in the next event",
                         initialEventsToSkip, startingRowNumber);
@@ -574,31 +570,30 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
                     MySqlConnectorConfig.BUFFER_SIZE_FOR_BINLOG_READER.name());
         }
 
-        final SchemaChangeEvent schemaChangeEvent = new SchemaChangeEvent(offsetContext.getPartition(),
-                offsetContext.getOffset(), source.struct(), command.getDatabase(), null, command.getSql(), false);
-        taskContext.getSchema().applySchemaChange(schemaChangeEvent, (newEvent, tableId) -> {
-            if (recordSchemaChangesInSourceRecords) {
-                try {
-                    eventDispatcher.dispatchSchemaChangeEvent(tableId, (receiver) -> {
-                        try {
-                            receiver.schemaChangeEvent(newEvent);
-                        }
-                        catch (Exception e) {
-                            throw new DebeziumException(e);
-                        }
-                    });
-                }
-                catch (InterruptedException e) {
-                    LOGGER.info("Processing interrupted");
-                }
+        final List<SchemaChangeEvent> schemaChangeEvents = taskContext.getSchema().parseStreamingDdl(sql, command.getDatabase(), offsetContext,
+                clock.currentTimeAsInstant());
+        try {
+            for (SchemaChangeEvent schemaChangeEvent : schemaChangeEvents) {
+                final TableId tableId = schemaChangeEvent.getTables().isEmpty() ? null : schemaChangeEvent.getTables().iterator().next().id();
+                eventDispatcher.dispatchSchemaChangeEvent(tableId, (receiver) -> {
+                    try {
+                        receiver.schemaChangeEvent(schemaChangeEvent);
+                    }
+                    catch (Exception e) {
+                        throw new DebeziumException(e);
+                    }
+                });
             }
-        });
+        }
+        catch (InterruptedException e) {
+            LOGGER.info("Processing interrupted");
+        }
     }
 
     private void handleTransactionCompletion(Event event) {
         // We are completing the transaction ...
-        source.commitTransaction();
-        source.setBinlogThread(-1L);
+        offsetContext.commitTransaction();
+        offsetContext.setBinlogThread(-1L);
         skipEvent = false;
         ignoreDmlEventByGtidSource = false;
     }
@@ -623,7 +618,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         String databaseName = metadata.getDatabase();
         String tableName = metadata.getTable();
         TableId tableId = new TableId(databaseName, null, tableName);
-        if (recordMakers.assign(tableNumber, tableId)) {
+        if (taskContext.getSchema().assignTableNumber(tableNumber, tableId)) {
             LOGGER.debug("Received update table metadata event: {}", event);
         }
         else {
@@ -645,8 +640,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
                 LOGGER.error(
                         "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}"
                                 + "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
-                        event, source.offset(), tableId, System.lineSeparator(), eventHeader.getPosition(),
-                        eventHeader.getNextPosition(), source.binlogFilename());
+                        event, offsetContext.getOffset(), tableId, System.lineSeparator(), eventHeader.getPosition(),
+                        eventHeader.getNextPosition(), offsetContext.getSource().binlogFilename());
                 throw new DebeziumException("Encountered change event for table " + tableId
                         + " whose schema isn't known to this connector");
             }
@@ -655,16 +650,16 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
                         "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}"
                                 + "The event will be ignored.{}"
                                 + "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
-                        event, source.offset(), tableId, System.lineSeparator(), System.lineSeparator(),
-                        eventHeader.getPosition(), eventHeader.getNextPosition(), source.binlogFilename());
+                        event, offsetContext.getOffset(), tableId, System.lineSeparator(), System.lineSeparator(),
+                        eventHeader.getPosition(), eventHeader.getNextPosition(), offsetContext.getSource().binlogFilename());
             }
             else {
                 LOGGER.debug(
                         "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}"
                                 + "The event will be ignored.{}"
                                 + "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
-                        event, source.offset(), tableId, System.lineSeparator(), System.lineSeparator(),
-                        eventHeader.getPosition(), eventHeader.getNextPosition(), source.binlogFilename());
+                        event, offsetContext.getOffset(), tableId, System.lineSeparator(), System.lineSeparator(),
+                        eventHeader.getPosition(), eventHeader.getNextPosition(), offsetContext.getSource().binlogFilename());
             }
         }
         else {
@@ -680,48 +675,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
      * @throws InterruptedException if this thread is interrupted while blocking
      */
     protected void handleInsert(Event event) throws InterruptedException {
-        if (skipEvent) {
-            // We can skip this because we should already be at least this far ...
-            LOGGER.info("Skipping previously processed row event: {}", event);
-            return;
-        }
-        if (ignoreDmlEventByGtidSource) {
-            LOGGER.debug("Skipping DML event because this GTID source is filtered: {}", event);
-            return;
-        }
-        WriteRowsEventData write = unwrapData(event);
-        long tableNumber = write.getTableId();
-        BitSet includedColumns = write.getIncludedColumns();
-        RecordsForTable recordMaker = recordMakers.forTable(tableNumber, includedColumns, record -> eventDispatcher
-                .dispatchDataChangeEvent(recordMakers.getTableIdFromTableNumber(tableNumber), new MySqlChangeRecordEmitter(offsetContext, Operation.CREATE, record)));
-        if (recordMaker != null) {
-            List<Serializable[]> rows = write.getRows();
-            final Instant ts = clock.currentTimeAsInstant();
-            int count = 0;
-            int numRows = rows.size();
-            if (startingRowNumber < numRows) {
-                for (int row = startingRowNumber; row != numRows; ++row) {
-                    count += recordMaker.create(rows.get(row), ts, row, numRows);
-                }
-                if (LOGGER.isDebugEnabled()) {
-                    if (startingRowNumber != 0) {
-                        LOGGER.debug("Recorded {} insert record(s) for last {} row(s) in event: {}",
-                                count, numRows - startingRowNumber, event);
-                    }
-                    else {
-                        LOGGER.debug("Recorded {} insert record(s) for event: {}", count, event);
-                    }
-                }
-            }
-            else {
-                // All rows were previously processed ...
-                LOGGER.debug("Skipping previously processed insert event: {}", event);
-            }
-        }
-        else {
-            informAboutUnknownTableIfRequired(event, recordMakers.getTableIdFromTableNumber(tableNumber), "insert row");
-        }
-        startingRowNumber = 0;
+        handleChange(event, "insert", WriteRowsEventData.class, x -> taskContext.getSchema().getTableId(x.getTableId()), WriteRowsEventData::getRows,
+                (tableId, row) -> eventDispatcher.dispatchDataChangeEvent(tableId, new MySqlChangeRecordEmitter(offsetContext, clock, Operation.CREATE, null, row)));
     }
 
     /**
@@ -731,52 +686,9 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
      * @throws InterruptedException if this thread is interrupted while blocking
      */
     protected void handleUpdate(Event event) throws InterruptedException {
-        if (skipEvent) {
-            // We can skip this because we should already be at least this far ...
-            LOGGER.debug("Skipping previously processed row event: {}", event);
-            return;
-        }
-        if (ignoreDmlEventByGtidSource) {
-            LOGGER.debug("Skipping DML event because this GTID source is filtered: {}", event);
-            return;
-        }
-        UpdateRowsEventData update = unwrapData(event);
-        long tableNumber = update.getTableId();
-        BitSet includedColumns = update.getIncludedColumns();
-        RecordsForTable recordMaker = recordMakers.forTable(tableNumber, includedColumns,
-                record -> eventDispatcher.dispatchDataChangeEvent(recordMakers.getTableIdFromTableNumber(tableNumber),
-                        new MySqlChangeRecordEmitter(offsetContext, Operation.UPDATE, record)));
-        if (recordMaker != null) {
-            List<Entry<Serializable[], Serializable[]>> rows = update.getRows();
-            final Instant ts = clock.currentTimeAsInstant();
-            int count = 0;
-            int numRows = rows.size();
-            if (startingRowNumber < numRows) {
-                for (int row = startingRowNumber; row != numRows; ++row) {
-                    Map.Entry<Serializable[], Serializable[]> changes = rows.get(row);
-                    Serializable[] before = changes.getKey();
-                    Serializable[] after = changes.getValue();
-                    count += recordMaker.update(before, after, ts, row, numRows);
-                }
-                if (LOGGER.isDebugEnabled()) {
-                    if (startingRowNumber != 0) {
-                        LOGGER.debug("Recorded {} update record(s) for last {} row(s) in event: {}",
-                                count, numRows - startingRowNumber, event);
-                    }
-                    else {
-                        LOGGER.debug("Recorded {} update record(s) for event: {}", count, event);
-                    }
-                }
-            }
-            else {
-                // All rows were previously processed ...
-                LOGGER.debug("Skipping previously processed update event: {}", event);
-            }
-        }
-        else {
-            informAboutUnknownTableIfRequired(event, recordMakers.getTableIdFromTableNumber(tableNumber), "update row");
-        }
-        startingRowNumber = 0;
+        handleChange(event, "update", UpdateRowsEventData.class, x -> taskContext.getSchema().getTableId(x.getTableId()), UpdateRowsEventData::getRows,
+                (tableId, row) -> eventDispatcher.dispatchDataChangeEvent(tableId,
+                        new MySqlChangeRecordEmitter(offsetContext, clock, Operation.UPDATE, row.getKey(), row.getValue())));
     }
 
     /**
@@ -786,47 +698,54 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
      * @throws InterruptedException if this thread is interrupted while blocking
      */
     protected void handleDelete(Event event) throws InterruptedException {
+        handleChange(event, "delete", DeleteRowsEventData.class, x -> taskContext.getSchema().getTableId(x.getTableId()), DeleteRowsEventData::getRows,
+                (tableId, row) -> eventDispatcher.dispatchDataChangeEvent(tableId, new MySqlChangeRecordEmitter(offsetContext, clock, Operation.DELETE, row, null)));
+    }
+
+    private <T extends EventData, U> void handleChange(Event event, String changeType, Class<T> eventDataClass, Function<T, TableId> tableIdProvider,
+                                                       Function<T, List<U>> rowsProvider, BinlogChangeEmitter<U> changeEmitter)
+            throws InterruptedException {
         if (skipEvent) {
             // We can skip this because we should already be at least this far ...
-            LOGGER.debug("Skipping previously processed row event: {}", event);
+            LOGGER.info("Skipping previously processed row event: {}", event);
             return;
         }
         if (ignoreDmlEventByGtidSource) {
             LOGGER.debug("Skipping DML event because this GTID source is filtered: {}", event);
             return;
         }
-        DeleteRowsEventData deleted = unwrapData(event);
-        long tableNumber = deleted.getTableId();
-        BitSet includedColumns = deleted.getIncludedColumns();
-        RecordsForTable recordMaker = recordMakers.forTable(tableNumber, includedColumns,
-                record -> eventDispatcher.dispatchDataChangeEvent(recordMakers.getTableIdFromTableNumber(tableNumber),
-                        new MySqlChangeRecordEmitter(offsetContext, Operation.DELETE, record)));
-        if (recordMaker != null) {
-            List<Serializable[]> rows = deleted.getRows();
-            final Instant ts = clock.currentTimeAsInstant();
+        final T data = unwrapData(event);
+        final TableId tableId = tableIdProvider.apply(data);
+        final List<U> rows = rowsProvider.apply(data);
+
+        if (tableId != null && taskContext.getSchema().schemaFor(tableId) != null) {
             int count = 0;
             int numRows = rows.size();
             if (startingRowNumber < numRows) {
                 for (int row = startingRowNumber; row != numRows; ++row) {
-                    count += recordMaker.delete(rows.get(row), ts, row, numRows);
+                    offsetContext.setRowNumber(row, numRows);
+                    offsetContext.event(tableId, eventTimestamp);
+                    changeEmitter.emit(tableId, rows.get(row));
+                    count++;
                 }
                 if (LOGGER.isDebugEnabled()) {
                     if (startingRowNumber != 0) {
-                        LOGGER.debug("Recorded {} delete record(s) for last {} row(s) in event: {}",
-                                count, numRows - startingRowNumber, event);
+                        LOGGER.debug("Emited {} {} record(s) for last {} row(s) in event: {}",
+                                count, changeType, numRows - startingRowNumber, event);
                     }
                     else {
-                        LOGGER.debug("Recorded {} delete record(s) for event: {}", count, event);
+                        LOGGER.debug("Emited {} {} record(s) for event: {}", count, changeType, event);
                     }
                 }
+                offsetContext.changeEventCompleted();
             }
             else {
                 // All rows were previously processed ...
-                LOGGER.debug("Skipping previously processed delete event: {}", event);
+                LOGGER.debug("Skipping previously processed {} event: {}", changeType, event);
             }
         }
         else {
-            informAboutUnknownTableIfRequired(event, recordMakers.getTableIdFromTableNumber(tableNumber), "delete row");
+            informAboutUnknownTableIfRequired(event, tableId, changeType + " row");
         }
         startingRowNumber = 0;
     }
@@ -942,28 +861,28 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
                 LOGGER.info("Registering binlog reader with GTID set: {}", filteredGtidSet);
                 String filteredGtidSetStr = filteredGtidSet.toString();
                 client.setGtidSet(filteredGtidSetStr);
-                source.setCompletedGtidSet(filteredGtidSetStr);
+                offsetContext.setCompletedGtidSet(filteredGtidSetStr);
                 gtidSet = new com.github.shyiko.mysql.binlog.GtidSet(filteredGtidSetStr);
             }
             else {
                 // We've not yet seen any GTIDs, so that means we have to start reading the binlog from the beginning ...
-                client.setBinlogFilename(source.binlogFilename());
-                client.setBinlogPosition(source.binlogPosition());
+                client.setBinlogFilename(offsetContext.getSource().binlogFilename());
+                client.setBinlogPosition(offsetContext.getSource().binlogPosition());
                 gtidSet = new com.github.shyiko.mysql.binlog.GtidSet("");
             }
         }
         else {
             // The server is not using GTIDs, so start reading the binlog based upon where we last left off ...
-            client.setBinlogFilename(source.binlogFilename());
-            client.setBinlogPosition(source.binlogPosition());
+            client.setBinlogFilename(offsetContext.getSource().binlogFilename());
+            client.setBinlogPosition(offsetContext.getSource().binlogPosition());
         }
 
         // We may be restarting in the middle of a transaction, so see how far into the transaction we have already processed...
-        initialEventsToSkip = source.eventsToSkipUponRestart();
+        initialEventsToSkip = offsetContext.eventsToSkipUponRestart();
         LOGGER.info("Skip {} events on streaming start", initialEventsToSkip);
 
         // Set the starting row number, which is the next row number to be read ...
-        startingRowNumber = source.rowsToSkipUponRestart();
+        startingRowNumber = offsetContext.rowsToSkipUponRestart();
         LOGGER.info("Skip {} rows on streaming start", startingRowNumber);
 
         // Only when we reach the first BEGIN event will we start to skip events ...
@@ -1146,7 +1065,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
      *         none were filtered
      */
     public GtidSet filterGtidSet(GtidSet availableServerGtidSet, GtidSet purgedServerGtid) {
-        String gtidStr = source.gtidSet();
+        String gtidStr = offsetContext.gtidSet();
         if (gtidStr == null) {
             return null;
         }
@@ -1247,7 +1166,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
             taskContext.configureLoggingContext("binlog");
 
             // The event row number will be used when processing the first event ...
-            LOGGER.info("Connected to MySQL binlog at {}:{}, starting at {}", connectorConfig.hostname(), connectorConfig.port(), source);
+            LOGGER.info("Connected to MySQL binlog at {}:{}, starting at {}", connectorConfig.hostname(), connectorConfig.port(), offsetContext);
         }
 
         @Override

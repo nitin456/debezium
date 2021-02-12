@@ -3,7 +3,7 @@
  *
  * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
  */
-package io.debezium.connector.mysql;
+package io.debezium.connector.mysql.legacy;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
@@ -12,6 +12,7 @@ import org.apache.kafka.connect.data.Struct;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.connector.LegacyV1AbstractSourceInfoStructMaker;
+import io.debezium.connector.mysql.MySqlOffsetContext;
 
 public class LegacyV1MySqlSourceInfoStructMaker extends LegacyV1AbstractSourceInfoStructMaker<SourceInfo> {
 

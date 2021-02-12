@@ -5,21 +5,20 @@
  */
 package io.debezium.connector.mysql;
 
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.data.Struct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.annotation.NotThreadSafe;
-import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.connector.mysql.MySqlSystemVariables.MySqlScope;
 import io.debezium.connector.mysql.antlr.MySqlAntlrDdlParser;
 import io.debezium.relational.HistorizedRelationalDatabaseSchema;
@@ -27,16 +26,22 @@ import io.debezium.relational.RelationalTableFilters;
 import io.debezium.relational.SystemVariables;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.relational.TableSchema;
 import io.debezium.relational.TableSchemaBuilder;
 import io.debezium.relational.Tables;
 import io.debezium.relational.ddl.DdlChanges;
 import io.debezium.relational.ddl.DdlChanges.DatabaseStatementStringConsumer;
 import io.debezium.relational.ddl.DdlParser;
 import io.debezium.relational.ddl.DdlParserListener.Event;
+import io.debezium.relational.ddl.DdlParserListener.SetVariableEvent;
+import io.debezium.relational.ddl.DdlParserListener.TableAlteredEvent;
+import io.debezium.relational.ddl.DdlParserListener.TableCreatedEvent;
+import io.debezium.relational.ddl.DdlParserListener.TableDroppedEvent;
 import io.debezium.relational.ddl.DdlParserListener.TableEvent;
+import io.debezium.relational.ddl.DdlParserListener.TableIndexCreatedEvent;
+import io.debezium.relational.ddl.DdlParserListener.TableIndexDroppedEvent;
 import io.debezium.relational.ddl.DdlParserListener.TableIndexEvent;
 import io.debezium.relational.history.DatabaseHistory;
-import io.debezium.relational.history.TableChanges;
 import io.debezium.schema.SchemaChangeEvent;
 import io.debezium.schema.SchemaChangeEvent.SchemaChangeEventType;
 import io.debezium.schema.TopicSelector;
@@ -72,6 +77,7 @@ public class MySqlDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     private final DdlParser ddlParser;
     private final RelationalTableFilters filters;
     private final DdlChanges ddlChanges;
+    private final Map<Long, TableId> tableIdsByTableNumber = new HashMap<>();
 
     /**
      * Create a schema component given the supplied {@link MySqlConnectorConfig MySQL connector configuration}.
@@ -155,22 +161,46 @@ public class MySqlDatabaseSchema extends HistorizedRelationalDatabaseSchema {
 
     @Override
     public void applySchemaChange(SchemaChangeEvent schemaChange) {
-        applySchemaChange(schemaChange, SchemaChangeEventConsumer.NOOP);
-    }
-
-    public void applySchemaChange(SchemaChangeEvent schemaChange, SchemaChangeEventConsumer schemaEventConsumer) {
-        LOGGER.debug("Applying schema change event {}", schemaChange);
-
-        if (schemaChange.getType() != SchemaChangeEventType.RAW) {
-            LOGGER.debug("Schema change already processed by the database schema");
-            return;
+        switch (schemaChange.getType()) {
+            case CREATE:
+            case ALTER:
+                schemaChange.getTableChanges().forEach(x -> buildAndRegisterSchema(x.getTable()));
+                break;
+            case DROP:
+                schemaChange.getTableChanges().forEach(x -> removeSchema(x.getId()));
+                break;
+            default:
         }
 
-        final String ddlStatements = schemaChange.getDdl();
-        final String databaseName = schemaChange.getDatabase();
+        // Record the DDL statement so that we can later recover them if needed. We do this _after_ writing the
+        // schema change records so that failure recovery (which is based on of the history) won't lose
+        // schema change records.
+        // We are storing either
+        // - all DDLs if configured
+        // - or global SET variables
+        // - or DDLs for monitored objects
+        if (!databaseHistory.storeOnlyMonitoredTables() || isGlobalSetVariableStatement(schemaChange.getDdl(), schemaChange.getDatabase())
+                || schemaChange.getTables().stream().map(Table::id).anyMatch(filters.dataCollectionFilter()::isIncluded)) {
+            LOGGER.debug("Recorded DDL statements for database '{}': {}", schemaChange.getDatabase(), schemaChange.getDdl());
+            record(schemaChange, schemaChange.getTableChanges());
+        }
+    }
+
+    public List<SchemaChangeEvent> parseSnapshotDdl(String ddlStatements, String databaseName, MySqlOffsetContext offset, Instant sourceTime) {
+        LOGGER.debug("Processing snapshot DDL '{}' for database '{}'", ddlStatements, databaseName);
+        return parseDdl(ddlStatements, databaseName, offset, sourceTime, true);
+    }
+
+    public List<SchemaChangeEvent> parseStreamingDdl(String ddlStatements, String databaseName, MySqlOffsetContext offset, Instant sourceTime) {
+        LOGGER.debug("Processing streaming DDL '{}' for database '{}'", ddlStatements, databaseName);
+        return parseDdl(ddlStatements, databaseName, offset, sourceTime, false);
+    }
+
+    private List<SchemaChangeEvent> parseDdl(String ddlStatements, String databaseName, MySqlOffsetContext offset, Instant sourceTime, boolean snapshot) {
+        final List<SchemaChangeEvent> schemaChangeEvents = new ArrayList<>();
 
         if (ignoredQueryStatements.contains(ddlStatements)) {
-            return;
+            return schemaChangeEvents;
         }
 
         try {
@@ -186,79 +216,76 @@ public class MySqlDatabaseSchema extends HistorizedRelationalDatabaseSchema {
                 throw e;
             }
         }
-        final Set<TableId> changes = tables().drainChanges();
+
         // No need to send schema events or store DDL if no table has changed
         if (!databaseHistory.storeOnlyMonitoredTables() || isGlobalSetVariableStatement(ddlStatements, databaseName) || ddlChanges.anyMatch(filters)) {
-            if (schemaEventConsumer != null) {
 
-                // We are supposed to _also_ record the schema changes as SourceRecords, but these need to be filtered
-                // by database. Unfortunately, the databaseName on the event might not be the same database as that
-                // being modified by the DDL statements (since the DDL statements can have fully-qualified names).
-                // Therefore, we have to look at each statement to figure out which database it applies and then
-                // record the DDL statements (still in the same order) to those databases.
-
-                if (!ddlChanges.isEmpty()) {
-                    // We understood at least some of the DDL statements and can figure out to which database they apply.
-                    // They also apply to more databases than 'databaseName', so we need to apply the DDL statements in
-                    // the same order they were read for each _affected_ database, grouped together if multiple apply
-                    // to the same _affected_ database...
-                    ddlChanges.getEventsByDatabase((String dbName, List<Event> events) -> {
-                        if (acceptableDatabase(dbName)) {
-                            final String sanitizedDbName = (dbName == null) ? "" : dbName;
-                            final Set<TableId> tableIds = new HashSet<>();
-                            events.forEach(event -> {
-                                final TableId tableId = getTableId(event);
-                                if (tableId != null) {
-                                    tableIds.add(tableId);
-                                }
-                            });
-                            final Struct source = schemaChange.getSource();
-                            source.put(AbstractSourceInfo.DATABASE_NAME_KEY, sanitizedDbName);
-                            final String tableNamesStr = tableIds.stream().map(TableId::table).collect(Collectors.joining(","));
-                            if (!tableNamesStr.isEmpty()) {
-                                source.put(AbstractSourceInfo.TABLE_NAME_KEY, tableNamesStr);
+            // We are supposed to _also_ record the schema changes as SourceRecords, but these need to be filtered
+            // by database. Unfortunately, the databaseName on the event might not be the same database as that
+            // being modified by the DDL statements (since the DDL statements can have fully-qualified names).
+            // Therefore, we have to look at each statement to figure out which database it applies and then
+            // record the DDL statements (still in the same order) to those databases.
+            if (!ddlChanges.isEmpty()) {
+                // We understood at least some of the DDL statements and can figure out to which database they apply.
+                // They also apply to more databases than 'databaseName', so we need to apply the DDL statements in
+                // the same order they were read for each _affected_ database, grouped together if multiple apply
+                // to the same _affected_ database...
+                ddlChanges.getEventsByDatabase((String dbName, List<Event> events) -> {
+                    final String sanitizedDbName = (dbName == null) ? "" : dbName;
+                    if (acceptableDatabase(dbName)) {
+                        final Set<TableId> tableIds = new HashSet<>();
+                        events.forEach(event -> {
+                            final TableId tableId = getTableId(event);
+                            if (tableId != null) {
+                                tableIds.add(tableId);
                             }
-                            schemaEventConsumer.consume(new SchemaChangeEvent(schemaChange.getPartition(),
-                                    schemaChange.getOffset(), schemaChange.getSource(), sanitizedDbName,
-                                    schemaChange.getSchema(), schemaChange.getDdl(), Collections.emptySet(), SchemaChangeEventType.DATABASE,
-                                    schemaChange.isFromSnapshot()),
-                                    tableIds);
-                        }
-                    });
-                }
-                else if (acceptableDatabase(databaseName)) {
-                    schemaEventConsumer.consume(schemaChange, null);
-                }
+                        });
+                        events.forEach(event -> {
+                            final TableId tableId = getTableId(event);
+                            offset.tableEvent(dbName, tableIds, sourceTime);
+                            // For SET with multpile parameters
+                            if (event instanceof TableCreatedEvent) {
+                                emitChangeEvent(offset, schemaChangeEvents, sanitizedDbName, event, tableId, SchemaChangeEventType.CREATE, snapshot);
+                            }
+                            else if (event instanceof TableAlteredEvent || event instanceof TableIndexCreatedEvent || event instanceof TableIndexDroppedEvent) {
+                                emitChangeEvent(offset, schemaChangeEvents, sanitizedDbName, event, tableId, SchemaChangeEventType.ALTER, snapshot);
+                            }
+                            else if (event instanceof TableDroppedEvent) {
+                                emitChangeEvent(offset, schemaChangeEvents, sanitizedDbName, event, tableId, SchemaChangeEventType.DROP, snapshot);
+                            }
+                            else if (event instanceof SetVariableEvent) {
+                                // SET statement with multiple variable emits event for each variable. We want to emit only
+                                // one change event
+                                final SetVariableEvent varEvent = (SetVariableEvent) event;
+                                if (varEvent.order() == 0) {
+                                    emitChangeEvent(offset, schemaChangeEvents, sanitizedDbName, event, tableId, SchemaChangeEventType.DATABASE, snapshot);
+                                }
+                            }
+                            else {
+                                emitChangeEvent(offset, schemaChangeEvents, sanitizedDbName, event, tableId, SchemaChangeEventType.DATABASE, snapshot);
+                            }
+                        });
+                    }
+                });
             }
-            // Record the DDL statement so that we can later recover them if needed. We do this _after_ writing the
-            // schema change records so that failure recovery (which is based on of the history) won't lose
-            // schema change records.
-            // We are storing either
-            // - all DDLs if configured
-            // - or global SET variables
-            // - or DDLs for monitored objects
-            if (!databaseHistory.storeOnlyMonitoredTables() || isGlobalSetVariableStatement(ddlStatements, databaseName)
-                    || changes.stream().anyMatch(filters.dataCollectionFilter()::isIncluded)) {
-                LOGGER.debug("Recorded DDL statements for database '{}': {}", databaseName, ddlStatements);
-                record(schemaChange, schemaChange.getTableChanges());
+            else if (acceptableDatabase(databaseName)) {
+                offset.databaseEvent(databaseName, sourceTime);
+                schemaChangeEvents
+                        .add(new SchemaChangeEvent(offset.getPartition(), offset.getOffset(), offset.getSourceInfo(),
+                                databaseName, null, ddlStatements, (Table) null, SchemaChangeEventType.DATABASE, snapshot));
             }
         }
         else {
             LOGGER.debug("Changes for DDL '{}' were filtered and not recorded in database history", ddlStatements);
         }
+        return schemaChangeEvents;
+    }
 
-        // Figure out what changed ...
-        TableChanges tableChanges = new TableChanges();
-        changes.forEach(tableId -> {
-            Table table = tableFor(tableId);
-            if (table == null) { // removed
-                removeSchema(tableId);
-            }
-            else {
-                buildAndRegisterSchema(table);
-                tableChanges.create(table);
-            }
-        });
+    private void emitChangeEvent(MySqlOffsetContext offset, List<SchemaChangeEvent> schemaChangeEvents,
+                                 final String sanitizedDbName, Event event, TableId tableId, SchemaChangeEvent.SchemaChangeEventType type,
+                                 boolean snapshot) {
+        schemaChangeEvents.add(new SchemaChangeEvent(offset.getPartition(), offset.getOffset(), offset.getSourceInfo(),
+                sanitizedDbName, null, event.statement(), tableId != null ? tableFor(tableId) : null, type, snapshot));
     }
 
     private boolean acceptableDatabase(final String databaseName) {
@@ -290,5 +317,42 @@ public class MySqlDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     @Override
     public boolean storeOnlyMonitoredTables() {
         return databaseHistory.storeOnlyMonitoredTables();
+    }
+
+    /**
+     * Assign the given table number to the table with the specified {@link TableId table ID}.
+     *
+     * @param tableNumber the table number found in binlog events
+     * @param id the identifier for the corresponding table
+     * @return {@code true} if the assignment was successful, or {@code false} if the table is currently excluded in the
+     *         connector's configuration
+     */
+    public boolean assignTableNumber(long tableNumber, TableId id) {
+        final TableSchema tableSchema = schemaFor(id);
+        if (tableSchema == null) {
+            return false;
+        }
+
+        tableIdsByTableNumber.put(tableNumber, id);
+        return true;
+    }
+
+    /**
+     * Return the table id associated with MySQL-specific table number.
+     *
+     * @param tableNumber
+     * @return the table id or null if not known
+     */
+    public TableId getTableId(long tableNumber) {
+        return tableIdsByTableNumber.get(tableNumber);
+    }
+
+    /**
+     * Clear all of the table mappings. This should be done when the logs are rotated, since in that a different table
+     * numbering scheme will be used by all subsequent TABLE_MAP binlog events.
+     */
+    public void clearTableMappings() {
+        LOGGER.debug("Clearing table number mappings");
+        tableIdsByTableNumber.clear();
     }
 }
