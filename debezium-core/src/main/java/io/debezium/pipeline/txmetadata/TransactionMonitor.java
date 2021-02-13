@@ -99,9 +99,9 @@ public class TransactionMonitor {
     }
 
     public void dataEvent(DataCollectionId source, OffsetContext offset, Object key, Struct value) throws InterruptedException {
-        LOGGER.info("TransactionMonitor.dataEvent");
+        // LOGGER.info("TransactionMonitor.dataEvent");
         if (!connectorConfig.shouldProvideTransactionMetadata()) {
-            LOGGER.info("Transaction metadata is not enabled.");
+            // LOGGER.info("Transaction metadata is not enabled.");
             return;
         }
         final TransactionContext transactionContext = offset.getTransactionContext();

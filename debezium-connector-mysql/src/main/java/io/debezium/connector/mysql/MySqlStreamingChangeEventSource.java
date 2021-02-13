@@ -525,12 +525,10 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         String sql = command.getSql().trim();
         if (sql.equalsIgnoreCase("BEGIN")) {
             // We are starting a new transaction ...
-            String txnId = offsetContext.getSource().getCurrentBinlogFilename() + "_" + offsetContext.getSource().getCurrentBinlogPosition();
-            if (connection.isGtidModeEnabled()) {
-                txnId = offsetContext.getSource().getCurrentGtid();
-            }
-            // eventDispatcher.dispatchTransactionStartedEvent(txnId, offsetContext);
             offsetContext.startNextTransaction();
+            LOGGER.info("transactionId in MySqlStreamingChangeEventSource: {}", offsetContext.getTransactionId());
+            eventDispatcher.dispatchTransactionStartedEvent(offsetContext.getTransactionId(), offsetContext);
+
             offsetContext.setBinlogThread(command.getThreadId());
             if (initialEventsToSkip != 0) {
                 LOGGER.debug("Restarting partially-processed transaction; change events will not be created for the first {} events plus {} more rows in the next event",
@@ -541,8 +539,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
             return;
         }
         if (sql.equalsIgnoreCase("COMMIT")) {
+            LOGGER.info("got COMMIT event");
             handleTransactionCompletion(event);
-            // eventDispatcher.dispatchTransactionCommittedEvent(offsetContext);
             return;
         }
 
@@ -596,8 +594,9 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         }
     }
 
-    private void handleTransactionCompletion(Event event) {
+    private void handleTransactionCompletion(Event event) throws InterruptedException {
         // We are completing the transaction ...
+        eventDispatcher.dispatchTransactionCommittedEvent(offsetContext);
         offsetContext.commitTransaction();
         offsetContext.setBinlogThread(-1L);
         skipEvent = false;
