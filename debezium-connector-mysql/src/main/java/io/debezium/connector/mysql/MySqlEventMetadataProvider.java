@@ -5,17 +5,16 @@
  */
 package io.debezium.connector.mysql;
 
-import java.time.Instant;
-import java.util.Map;
-
-import org.apache.kafka.connect.data.Struct;
-
 import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.data.Envelope;
 import io.debezium.pipeline.source.spi.EventMetadataProvider;
 import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.schema.DataCollectionId;
 import io.debezium.util.Collect;
+import org.apache.kafka.connect.data.Struct;
+
+import java.time.Instant;
+import java.util.Map;
 
 class MySqlEventMetadataProvider implements EventMetadataProvider {
 
@@ -58,6 +57,11 @@ class MySqlEventMetadataProvider implements EventMetadataProvider {
         if (source == null) {
             return null;
         }
-        return sourceInfo.getString(SourceInfo.GTID_KEY);
+        String txnId = sourceInfo.getString(SourceInfo.GTID_KEY);
+        // if (txnId == null) {
+        // txnId = sourceInfo.getString(SourceInfo.BINLOG_FILENAME_OFFSET_KEY) + "_" + sourceInfo.getInt64(SourceInfo.BINLOG_POSITION_OFFSET_KEY);
+        // }
+        return txnId;
     }
+
 }

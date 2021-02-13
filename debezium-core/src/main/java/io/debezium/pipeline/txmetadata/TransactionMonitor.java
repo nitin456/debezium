@@ -99,7 +99,9 @@ public class TransactionMonitor {
     }
 
     public void dataEvent(DataCollectionId source, OffsetContext offset, Object key, Struct value) throws InterruptedException {
+        LOGGER.info("TransactionMonitor.dataEvent");
         if (!connectorConfig.shouldProvideTransactionMetadata()) {
+            LOGGER.info("Transaction metadata is not enabled.");
             return;
         }
         final TransactionContext transactionContext = offset.getTransactionContext();
@@ -126,6 +128,7 @@ public class TransactionMonitor {
     }
 
     public void transactionComittedEvent(OffsetContext offset) throws InterruptedException {
+        LOGGER.info("TransactionMonitor.transactionComittedEvent");
         if (!connectorConfig.shouldProvideTransactionMetadata()) {
             return;
         }
@@ -134,6 +137,7 @@ public class TransactionMonitor {
     }
 
     public void transactionStartedEvent(String transactionId, OffsetContext offset) throws InterruptedException {
+        LOGGER.info("TransactionMonitor.transactionStartedEvent");
         if (!connectorConfig.shouldProvideTransactionMetadata()) {
             return;
         }
@@ -142,6 +146,7 @@ public class TransactionMonitor {
     }
 
     private void transactionEvent(OffsetContext offsetContext, DataCollectionId source, Struct value) {
+        LOGGER.info("TransactionMonitor.transactionEvent");
         final long dataCollectionEventOrder = offsetContext.getTransactionContext().event(source);
         if (value == null) {
             LOGGER.debug("Event with key {} without value. Cannot enrich source block.");
@@ -155,6 +160,7 @@ public class TransactionMonitor {
     }
 
     private void beginTransaction(OffsetContext offsetContext) throws InterruptedException {
+        LOGGER.info("beginTransaction event");
         final Struct key = new Struct(TRANSACTION_KEY_SCHEMA);
         key.put(DEBEZIUM_TRANSACTION_ID_KEY, offsetContext.getTransactionContext().getTransactionId());
         final Struct value = new Struct(TRANSACTION_VALUE_SCHEMA);
@@ -166,6 +172,7 @@ public class TransactionMonitor {
     }
 
     private void endTransaction(OffsetContext offsetContext) throws InterruptedException {
+        LOGGER.info("endTransaction event");
         final Struct key = new Struct(TRANSACTION_KEY_SCHEMA);
         key.put(DEBEZIUM_TRANSACTION_ID_KEY, offsetContext.getTransactionContext().getTransactionId());
         final Struct value = new Struct(TRANSACTION_VALUE_SCHEMA);

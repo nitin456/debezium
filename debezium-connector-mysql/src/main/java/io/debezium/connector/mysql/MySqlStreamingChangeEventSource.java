@@ -525,6 +525,11 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         String sql = command.getSql().trim();
         if (sql.equalsIgnoreCase("BEGIN")) {
             // We are starting a new transaction ...
+            String txnId = offsetContext.getSource().getCurrentBinlogFilename() + "_" + offsetContext.getSource().getCurrentBinlogPosition();
+            if (connection.isGtidModeEnabled()) {
+                txnId = offsetContext.getSource().getCurrentGtid();
+            }
+            // eventDispatcher.dispatchTransactionStartedEvent(txnId, offsetContext);
             offsetContext.startNextTransaction();
             offsetContext.setBinlogThread(command.getThreadId());
             if (initialEventsToSkip != 0) {
@@ -537,6 +542,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         }
         if (sql.equalsIgnoreCase("COMMIT")) {
             handleTransactionCompletion(event);
+            // eventDispatcher.dispatchTransactionCommittedEvent(offsetContext);
             return;
         }
 
