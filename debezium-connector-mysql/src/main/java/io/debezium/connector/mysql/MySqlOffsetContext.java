@@ -165,8 +165,17 @@ public class MySqlOffsetContext implements OffsetContext {
         return transactionId;
     }
 
-    public void setTransactionId(String transactionId) {
-        this.transactionId = transactionId;
+    private void setTransactionId() {
+        if (sourceInfo.getCurrentGtid() != null) {
+            this.transactionId = sourceInfo.getCurrentGtid();
+        }
+        else {
+            this.transactionId = this.restartBinlogFilename + "_" + this.restartBinlogPosition;
+        }
+    }
+
+    private void resetTransactionId() {
+        transactionId = null;
     }
 
     public static class Loader implements OffsetContext.Loader {
@@ -321,7 +330,7 @@ public class MySqlOffsetContext implements OffsetContext {
         this.restartBinlogFilename = sourceInfo.binlogFilename();
         this.restartBinlogPosition = sourceInfo.binlogPosition();
         this.inTransaction = true;
-        this.transactionId = this.restartBinlogFilename + "_" + this.restartBinlogPosition;
+        setTransactionId();
     }
 
     public void commitTransaction() {
@@ -331,8 +340,8 @@ public class MySqlOffsetContext implements OffsetContext {
         this.restartRowsToSkip = 0;
         this.restartEventsToSkip = 0;
         this.inTransaction = false;
-        this.transactionId = null;
         sourceInfo.setQuery(null);
+        resetTransactionId();
     }
 
     /**
