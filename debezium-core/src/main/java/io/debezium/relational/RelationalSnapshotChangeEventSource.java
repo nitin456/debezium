@@ -139,10 +139,12 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
             }
             else {
                 LOGGER.info("Snapshot step 7 - Skipping snapshotting of data");
+                releaseDataSnapshotLocks(ctx);
                 ctx.offset.preSnapshotCompletion();
                 ctx.offset.postSnapshotCompletion();
             }
 
+            postSnapshot();
             dispatcher.alwaysDispatchHeartbeatEvent(ctx.offset);
             return SnapshotResult.completed(ctx.offset);
         }
@@ -240,6 +242,12 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
      */
     protected abstract void releaseSchemaSnapshotLocks(RelationalSnapshotContext snapshotContext) throws Exception;
 
+    /**
+     * Releases all locks established in order to create a consistent data snapshot.
+     */
+    protected void releaseDataSnapshotLocks(RelationalSnapshotContext snapshotContext) throws Exception {
+    }
+
     protected void createSchemaChangeEventsForTables(ChangeEventSourceContext sourceContext, RelationalSnapshotContext snapshotContext, SnapshottingTask snapshottingTask)
             throws Exception {
         tryStartingSnapshot(snapshotContext);
@@ -258,7 +266,7 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
 
                 // If data are not snapshotted then the last schema change must set last snapshot flag
                 if (!snapshottingTask.snapshotData() && !iterator.hasNext()) {
-                    snapshotContext.offset.markLastSnapshotRecord();
+                    lastSnapshotRecord(snapshotContext);
                 }
                 dispatcher.dispatchSchemaChangeEvent(table.id(), (receiver) -> {
                     try {
@@ -277,7 +285,7 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
      */
     protected abstract SchemaChangeEvent getCreateTableEvent(RelationalSnapshotContext snapshotContext, Table table) throws Exception;
 
-    private void createDataEvents(ChangeEventSourceContext sourceContext, RelationalSnapshotContext snapshotContext) throws InterruptedException {
+    private void createDataEvents(ChangeEventSourceContext sourceContext, RelationalSnapshotContext snapshotContext) throws Exception {
         SnapshotReceiver snapshotReceiver = dispatcher.getSnapshotChangeEventReceiver();
         tryStartingSnapshot(snapshotContext);
 
@@ -297,6 +305,7 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
             createDataEventsForTable(sourceContext, snapshotContext, snapshotReceiver, snapshotContext.tables.forTable(tableId), tableOrder++, tableCount);
         }
 
+        releaseDataSnapshotLocks(snapshotContext);
         snapshotContext.offset.preSnapshotCompletion();
         snapshotReceiver.completeSnapshot();
         snapshotContext.offset.postSnapshotCompletion();
@@ -363,14 +372,13 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
                     }
 
                     if (snapshotContext.lastTable && snapshotContext.lastRecordInTable) {
-                        snapshotContext.offset.markLastSnapshotRecord();
+                        lastSnapshotRecord(snapshotContext);
                     }
                     dispatcher.dispatchSnapshotEvent(table.id(), getChangeRecordEmitter(snapshotContext, table.id(), row), snapshotReceiver);
                 }
             }
             else if (snapshotContext.lastTable) {
-                // if the last table does not contain any records we still need to mark the last processed event as the last one
-                snapshotContext.offset.markLastSnapshotRecord();
+                lastSnapshotRecord(snapshotContext);
             }
 
             LOGGER.info("\t Finished exporting {} records for table '{}'; total duration '{}'", rows,
@@ -380,6 +388,10 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
         catch (SQLException e) {
             throw new ConnectException("Snapshotting of table " + table.id() + " failed", e);
         }
+    }
+
+    protected void lastSnapshotRecord(RelationalSnapshotContext snapshotContext) {
+        snapshotContext.offset.markLastSnapshotRecord();
     }
 
     /**
@@ -488,5 +500,8 @@ public abstract class RelationalSnapshotChangeEventSource extends AbstractSnapsh
 
     protected Clock getClock() {
         return clock;
+    }
+
+    protected void postSnapshot() throws InterruptedException {
     }
 }

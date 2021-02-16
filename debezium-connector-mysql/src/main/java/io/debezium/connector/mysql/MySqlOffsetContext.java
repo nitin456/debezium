@@ -42,7 +42,6 @@ public class MySqlOffsetContext implements OffsetContext {
     private long restartEventsToSkip = 0;
     private long currentEventLengthInBytes = 0;
     private boolean inTransaction = false;
-    private String transactionId;
 
     public MySqlOffsetContext(MySqlConnectorConfig connectorConfig, boolean snapshot, boolean snapshotCompleted,
                               TransactionContext transactionContext, SourceInfo sourceInfo) {
@@ -159,23 +158,6 @@ public class MySqlOffsetContext implements OffsetContext {
         final MySqlOffsetContext offset = new MySqlOffsetContext(config, false, false, new SourceInfo(config));
         offset.setBinlogStartPoint("", 0L); // start from the beginning of the binlog
         return offset;
-    }
-
-    public String getTransactionId() {
-        return transactionId;
-    }
-
-    private void setTransactionId() {
-        if (sourceInfo.getCurrentGtid() != null) {
-            this.transactionId = sourceInfo.getCurrentGtid();
-        }
-        else {
-            this.transactionId = this.restartBinlogFilename + "_" + this.restartBinlogPosition;
-        }
-    }
-
-    private void resetTransactionId() {
-        transactionId = null;
     }
 
     public static class Loader implements OffsetContext.Loader {
@@ -330,7 +312,6 @@ public class MySqlOffsetContext implements OffsetContext {
         this.restartBinlogFilename = sourceInfo.binlogFilename();
         this.restartBinlogPosition = sourceInfo.binlogPosition();
         this.inTransaction = true;
-        setTransactionId();
     }
 
     public void commitTransaction() {
@@ -341,7 +322,6 @@ public class MySqlOffsetContext implements OffsetContext {
         this.restartEventsToSkip = 0;
         this.inTransaction = false;
         sourceInfo.setQuery(null);
-        resetTransactionId();
     }
 
     /**

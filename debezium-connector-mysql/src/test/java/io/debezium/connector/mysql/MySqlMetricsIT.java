@@ -10,6 +10,7 @@ import static org.fest.assertions.Assertions.assertThat;
 import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 
 import javax.management.InstanceNotFoundException;
@@ -17,6 +18,7 @@ import javax.management.MBeanServer;
 import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName;
 
+import org.awaitility.Awaitility;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -122,7 +124,15 @@ public class MySqlMetricsIT extends AbstractConnectorTest {
                         .build());
 
         assertSnapshotMetrics();
-        assertStreamingMetricsExist();
+        // The legacy implementation did not exposed streaming metrics when only snapshot was executed.
+        // All other connectors based on new framework exposes streaming metrics always so we are
+        // following the same behaviour in the new implementation
+        if (isLegacy()) {
+            assertNoStreamingMetricsExist();
+        }
+        else {
+            assertStreamingMetricsExist();
+        }
     }
 
     @Test
@@ -246,6 +256,8 @@ public class MySqlMetricsIT extends AbstractConnectorTest {
         assertThat((Long) mBeanServer.getAttribute(getStreamingMetricsObjectName(), "TotalNumberOfEventsSeen"))
                 .isGreaterThanOrEqualTo(events);
 
+        Awaitility.await().atMost(Duration.ofMinutes(1)).until(() -> ((String[]) mBeanServer
+                .getAttribute(getStreamingMetricsObjectName(), "MonitoredTables")).length > 0);
         assertThat(mBeanServer.getAttribute(getStreamingMetricsObjectName(), "MonitoredTables"))
                 .isEqualTo(new String[]{ DATABASE.qualifiedTableName("simple") });
     }
@@ -255,7 +267,7 @@ public class MySqlMetricsIT extends AbstractConnectorTest {
     }
 
     private ObjectName getStreamingMetricsObjectName() throws MalformedObjectNameException {
-        return getStreamingMetricsObjectName("mysql", SERVER_NAME, "streaming");
+        return getStreamingMetricsObjectName("mysql", SERVER_NAME, getStreamingNamespace());
     }
 
     private void waitForSnapshotToBeCompleted() throws InterruptedException {
@@ -263,6 +275,10 @@ public class MySqlMetricsIT extends AbstractConnectorTest {
     }
 
     private void waitForStreamingToStart() throws InterruptedException {
-        waitForStreamingRunning("mysql", SERVER_NAME, "streaming");
+        waitForStreamingRunning("mysql", SERVER_NAME, getStreamingNamespace());
+    }
+
+    protected static boolean isLegacy() {
+        return MySqlConnector.LEGACY_IMPLEMENTATION.equals(System.getProperty(MySqlConnector.IMPLEMENTATION_PROP, "new"));
     }
 }

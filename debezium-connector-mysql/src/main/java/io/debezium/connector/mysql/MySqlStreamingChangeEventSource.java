@@ -28,7 +28,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Function;
 import java.util.function.Predicate;
 
 import javax.net.ssl.KeyManager;
@@ -67,6 +66,7 @@ import com.github.shyiko.mysql.binlog.network.SSLSocketFactory;
 import com.github.shyiko.mysql.binlog.network.ServerException;
 
 import io.debezium.DebeziumException;
+import io.debezium.annotation.SingleThreadAccess;
 import io.debezium.config.CommonConnectorConfig.EventProcessingFailureHandlingMode;
 import io.debezium.config.Configuration;
 import io.debezium.connector.mysql.MySqlConnectorConfig.GtidNewChannelPosition;
@@ -79,7 +79,6 @@ import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.relational.TableId;
 import io.debezium.schema.SchemaChangeEvent;
 import io.debezium.util.Clock;
-import io.debezium.util.ElapsedTimeStrategy;
 import io.debezium.util.Metronome;
 import io.debezium.util.Strings;
 import io.debezium.util.Threads;
@@ -92,22 +91,16 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
 
     private static final Logger LOGGER = LoggerFactory.getLogger(MySqlStreamingChangeEventSource.class);
 
-    private static final long INITIAL_POLL_PERIOD_IN_MILLIS = TimeUnit.SECONDS.toMillis(5);
-    private static final long MAX_POLL_PERIOD_IN_MILLIS = TimeUnit.HOURS.toMillis(1);
     private static final String KEEPALIVE_THREAD_NAME = "blc-keepalive";
 
-    private final boolean recordSchemaChangesInSourceRecords;
     private final EnumMap<EventType, BlockingConsumer<Event>> eventHandlers = new EnumMap<>(EventType.class);
     private final BinaryLogClient client;
     private final MySqlStreamingChangeEventSourceMetrics metrics;
     private final Clock clock;
-    private final ElapsedTimeStrategy pollOutputDelay;
     private final EventProcessingFailureHandlingMode eventDeserializationFailureHandlingMode;
     private final EventProcessingFailureHandlingMode inconsistentSchemaHandlingMode;
 
     private int startingRowNumber = 0;
-    private long recordCounter = 0L;
-    private long previousOutputMillis = 0L;
     private long initialEventsToSkip = 0L;
     private boolean skipEvent = false;
     private boolean ignoreDmlEventByGtidSource = false;
@@ -123,6 +116,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
     private final EventDispatcher<TableId> eventDispatcher;
     private final MySqlOffsetContext offsetContext;
     private final ErrorHandler errorHandler;
+
+    @SingleThreadAccess("binlog client thread")
     private Instant eventTimestamp;
 
     public static class BinlogPosition {
@@ -199,12 +194,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         this.offsetContext = (offsetContext == null) ? MySqlOffsetContext.initial(connectorConfig) : offsetContext;
         this.metrics = metrics;
 
-        recordSchemaChangesInSourceRecords = connectorConfig.includeSchemaChangeRecords();
         eventDeserializationFailureHandlingMode = connectorConfig.getEventProcessingFailureHandlingMode();
         inconsistentSchemaHandlingMode = connectorConfig.inconsistentSchemaFailureHandlingMode();
-
-        // Use exponential delay to log the progress frequently at first, but the quickly tapering off to once an hour...
-        pollOutputDelay = ElapsedTimeStrategy.exponential(clock, INITIAL_POLL_PERIOD_IN_MILLIS, MAX_POLL_PERIOD_IN_MILLIS);
 
         // Set up the log reader ...
         client = taskContext.getBinaryLogClient();
@@ -526,8 +517,6 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         if (sql.equalsIgnoreCase("BEGIN")) {
             // We are starting a new transaction ...
             offsetContext.startNextTransaction();
-            eventDispatcher.dispatchTransactionStartedEvent(offsetContext.getTransactionId(), offsetContext);
-
             offsetContext.setBinlogThread(command.getThreadId());
             if (initialEventsToSkip != 0) {
                 LOGGER.debug("Restarting partially-processed transaction; change events will not be created for the first {} events plus {} more rows in the next event",
@@ -538,7 +527,6 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
             return;
         }
         if (sql.equalsIgnoreCase("COMMIT")) {
-            LOGGER.info("got COMMIT event");
             handleTransactionCompletion(event);
             return;
         }
@@ -593,9 +581,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         }
     }
 
-    private void handleTransactionCompletion(Event event) throws InterruptedException {
+    private void handleTransactionCompletion(Event event) {
         // We are completing the transaction ...
-        eventDispatcher.dispatchTransactionCommittedEvent(offsetContext);
         offsetContext.commitTransaction();
         offsetContext.setBinlogThread(-1L);
         skipEvent = false;
@@ -706,8 +693,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
                 (tableId, row) -> eventDispatcher.dispatchDataChangeEvent(tableId, new MySqlChangeRecordEmitter(offsetContext, clock, Operation.DELETE, row, null)));
     }
 
-    private <T extends EventData, U> void handleChange(Event event, String changeType, Class<T> eventDataClass, Function<T, TableId> tableIdProvider,
-                                                       Function<T, List<U>> rowsProvider, BinlogChangeEmitter<U> changeEmitter)
+    private <T extends EventData, U> void handleChange(Event event, String changeType, Class<T> eventDataClass, TableIdProvider<T> tableIdProvider,
+                                                       RowsProvider<T, U> rowsProvider, BinlogChangeEmitter<U> changeEmitter)
             throws InterruptedException {
         if (skipEvent) {
             // We can skip this because we should already be at least this far ...
@@ -719,8 +706,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
             return;
         }
         final T data = unwrapData(event);
-        final TableId tableId = tableIdProvider.apply(data);
-        final List<U> rows = rowsProvider.apply(data);
+        final TableId tableId = tableIdProvider.getTableId(data);
+        final List<U> rows = rowsProvider.getRows(data);
 
         if (tableId != null && taskContext.getSchema().schemaFor(tableId) != null) {
             int count = 0;
@@ -734,11 +721,11 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
                 }
                 if (LOGGER.isDebugEnabled()) {
                     if (startingRowNumber != 0) {
-                        LOGGER.debug("Emited {} {} record(s) for last {} row(s) in event: {}",
+                        LOGGER.debug("Emitted {} {} record(s) for last {} row(s) in event: {}",
                                 count, changeType, numRows - startingRowNumber, event);
                     }
                     else {
-                        LOGGER.debug("Emited {} {} record(s) for event: {}", count, changeType, event);
+                        LOGGER.debug("Emitted {} {} record(s) for event: {}", count, changeType, event);
                     }
                 }
                 offsetContext.changeEventCompleted();
@@ -891,10 +878,6 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
 
         // Only when we reach the first BEGIN event will we start to skip events ...
         skipEvent = false;
-
-        // Initial our poll output delay logic ...
-        pollOutputDelay.hasElapsed();
-        previousOutputMillis = clock.currentTimeInMillis();
 
         try {
             // Start the log reader, which starts background threads ...
@@ -1205,4 +1188,13 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         }
     }
 
+    @FunctionalInterface
+    private interface TableIdProvider<E extends EventData> {
+        TableId getTableId(E data);
+    }
+
+    @FunctionalInterface
+    private interface RowsProvider<E extends EventData, U> {
+        List<U> getRows(E data);
+    }
 }
