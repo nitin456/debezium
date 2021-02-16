@@ -526,7 +526,6 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         if (sql.equalsIgnoreCase("BEGIN")) {
             // We are starting a new transaction ...
             offsetContext.startNextTransaction();
-            LOGGER.info("transactionId in MySqlStreamingChangeEventSource: {}", offsetContext.getTransactionId());
             eventDispatcher.dispatchTransactionStartedEvent(offsetContext.getTransactionId(), offsetContext);
 
             offsetContext.setBinlogThread(command.getThreadId());
