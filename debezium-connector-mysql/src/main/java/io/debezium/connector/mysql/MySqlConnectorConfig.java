@@ -955,7 +955,8 @@ public class MySqlConnectorConfig extends HistorizedRelationalDatabaseConnectorC
                     SNAPSHOT_NEW_TABLES,
                     BIGINT_UNSIGNED_HANDLING_MODE,
                     TIME_PRECISION_MODE,
-                    ENABLE_TIME_ADJUSTER)
+                    ENABLE_TIME_ADJUSTER,
+                    PROVIDE_TRANSACTION_METADATA)
             .events(
                     INCLUDE_SQL_QUERY,
                     TABLE_IGNORE_BUILTIN,
